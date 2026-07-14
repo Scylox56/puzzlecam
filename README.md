@@ -30,10 +30,10 @@ What I did here is take that idea and rebuild it from scratch in React and TypeS
 
 ## Running it locally
 
-\`\`\`bash
+```bash
 npm install
 npm run dev
-\`\`\`
+```
 
 Open the printed local URL and allow camera access. Chrome or Edge is recommended, since hand tracking relies on WebGL/GPU acceleration that's most consistent there.
 
