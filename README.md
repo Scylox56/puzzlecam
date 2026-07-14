@@ -37,7 +37,9 @@ npm run dev
 
 Open the printed local URL and allow camera access. Chrome or Edge is recommended, since hand tracking relies on WebGL/GPU acceleration that's most consistent there.
 
-\`npm run build\` produces a static \`dist/\` folder that can be deployed anywhere that serves static files, including Vercel, Netlify, or GitHub Pages — there's no backend or server-side component, everything runs in the browser.
+\`npm run build\` produces a static \`dist/\` folder that can be deployed anywhere that serves static files, including Vercel, Netlify, or GitHub Pages. there's no backend or server-side component, everything runs in the browser.
+
+## Website Link
 Alternatively you can try out puzzle cam [here](https://puzzlecam-tan.vercel.app)
 
 ## Tuning gestures
