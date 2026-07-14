@@ -41,4 +41,4 @@ Open the printed local URL and allow camera access. Chrome or Edge is recommende
 
 ## Tuning gestures
 
-If pinch, fist, or the drawing rectangle feel too sensitive or not sensitive enough for your hand size, lighting, or distance from the camera, the relevant thresholds are constants near the top of \`src/engine/puzzleCamEngine.ts\`: \`PINCH_THRESHOLD\`, \`FREEZE_HOLD_MS\`, \`FIST_HOLD_FRAMES\`, \`SNAP_DISTANCE_RATIO\`, and \`COUNTDOWN_SECONDS\` among them. They're grouped together specifically so they're easy to find and adjust without digging through the rest of the engine.
+If pinch, fist, or the drawing rectangle feel too sensitive or not sensitive enough for your hand size, lighting, or distance from the camera, the relevant thresholds are constants near the top of `src/engine/puzzleCamEngine.ts`: `PINCH_THRESHOLD\`, `FREEZE_HOLD_MS\`, `FIST_HOLD_FRAMES\`, `SNAP_DISTANCE_RATIO\`, and `COUNTDOWN_SECONDS\` among them. They're grouped together specifically so they're easy to find and adjust without digging through the rest of the engine.
