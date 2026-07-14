@@ -1,0 +1,190 @@
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  background: #0b0b0c;
+  font-family: 'IBM Plex Mono', 'Courier New', monospace;
+}
+
+.app {
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.stage {
+  display: flex;
+  height: 100%;
+  width: 100%;
+}
+
+.camera-area {
+  position: relative;
+  width: 75%;
+  height: 100%;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.hidden-video {
+  display: none;
+}
+
+.scene-canvas {
+  display: block;
+}
+
+.status-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 1.1rem;
+  text-align: center;
+  padding: 2rem;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 5;
+}
+
+.status-overlay.error {
+  color: #ff6b6b;
+}
+
+.hud {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #eae5d6;
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #666;
+}
+
+.status-dot.live {
+  background: #f5c518;
+}
+
+.status-dot.armed {
+  background: #ff9f45;
+  box-shadow: 0 0 8px #ff9f45;
+}
+
+.status-dot.solved {
+  background: #5fae6e;
+  box-shadow: 0 0 8px #5fae6e;
+}
+
+.progress-badge {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #f5c518;
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.progress-badge.solved {
+  color: #5fae6e;
+}
+
+.bar {
+  width: 25%;
+  height: 100%;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+
+.bar-title {
+  font-weight: 700;
+  color: #333;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+}
+
+.gallery-strip {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.gallery-empty {
+  color: #999;
+  font-size: 0.8rem;
+  text-align: center;
+  padding: 24px 0;
+}
+
+.print {
+  background: #fafafa;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  padding: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.print img {
+  width: 100%;
+  display: block;
+  border-radius: 4px;
+}
+
+.print-label {
+  margin-top: 4px;
+  font-size: 0.7rem;
+  color: #888;
+  text-align: center;
+}
+
+.bar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bar-actions button {
+  padding: 10px;
+  border-radius: 6px;
+  border: none;
+  background: #111;
+  color: #fff;
+  font-family: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.bar-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bar-actions button.secondary {
+  background: #eee;
+  color: #333;
+}

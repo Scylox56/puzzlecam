@@ -1,0 +1,1169 @@
+import {
+  FilesetResolver,
+  HandLandmarker,
+  type NormalizedLandmark,
+} from "@mediapipe/tasks-vision";
+
+type Hand = NormalizedLandmark[];
+
+const LM = {
+  WRIST: 0,
+  THUMB_TIP: 4,
+  INDEX_MCP: 5,
+  INDEX_TIP: 8,
+  MIDDLE_TIP: 12,
+  RING_TIP: 16,
+  PINKY_TIP: 20,
+  MIDDLE_MCP: 9,
+  RING_MCP: 13,
+  PINKY_MCP: 17,
+};
+
+const PINCH_THRESHOLD = 0.055;
+const FRAME_PADDING = 28;
+const FREEZE_HOLD_MS = 250;
+const COUNTDOWN_SECONDS = 5;
+const FIST_HOLD_FRAMES = 12;
+const SNAP_DISTANCE_RATIO = 0.6;
+const GRID = 3;
+const LOAD_TIMEOUT_MS = 20000;
+const FRAME_GRACE_MS = 450;
+const DISPLACE_ANIM_MS = 220;
+const SHATTER_COLS = 6;
+const SHATTER_ROWS = 6;
+const SHATTER_DURATION_MS = 850;
+const STRIP_MAX_PHOTOS = 3;
+
+const PHOTOBOOTH_CONTRAST_ALPHA = 1.3;
+const PHOTOBOOTH_BRIGHTNESS_BETA = 10;
+const PHOTOBOOTH_NOISE_STD = 15;
+
+const HAND_CONNECTIONS: [number, number][] = [
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4],
+  [0, 5],
+  [5, 6],
+  [6, 7],
+  [7, 8],
+  [5, 9],
+  [9, 10],
+  [10, 11],
+  [11, 12],
+  [9, 13],
+  [13, 14],
+  [14, 15],
+  [15, 16],
+  [13, 17],
+  [17, 18],
+  [18, 19],
+  [19, 20],
+  [0, 17],
+];
+
+interface Box {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface Piece {
+  row: number;
+  col: number;
+  canvas: HTMLCanvasElement;
+  w: number;
+  h: number;
+  x: number;
+  y: number;
+  placed: boolean;
+  dragging: boolean;
+  displacing?: boolean;
+}
+
+interface Fragment {
+  canvas: HTMLCanvasElement;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  vx: number;
+  vy: number;
+  rotation: number;
+  rotationSpeed: number;
+  gravity: number;
+}
+
+export interface EngineCallbacks {
+  onStatus: (text: string) => void;
+  onDotState: (state: "idle" | "live" | "armed" | "solved") => void;
+  onProgress: (visible: boolean, text: string, solved: boolean) => void;
+  onGalleryAdd: (thumbCanvas: HTMLCanvasElement, index: number) => void;
+  onGalleryFull: () => void;
+  onReset: () => void;
+}
+
+export interface EngineHandle {
+  destroy: () => void;
+  downloadStrip: () => void;
+  resetEverything: () => void;
+}
+
+export async function startPuzzleCamEngine(
+  videoEl: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+  cb: EngineCallbacks,
+): Promise<EngineHandle> {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+
+  let appState: "tracking" | "countdown" | "puzzle" | "shattering" = "tracking";
+  let destroyed = false;
+  let handLandmarker: HandLandmarker | null = null;
+  let fistHoldCounter = 0;
+  let rafId = 0;
+
+  const puzzle: {
+    boardBox: Box | null;
+    pieces: Piece[];
+    solved: boolean;
+    tileW: number;
+    tileH: number;
+    fullPhotoboothCanvas: HTMLCanvasElement | null;
+  } = {
+    boardBox: null,
+    pieces: [],
+    solved: false,
+    tileW: 0,
+    tileH: 0,
+    fullPhotoboothCanvas: null,
+  };
+
+  const shatter: {
+    active: boolean;
+    startedAt: number;
+    fragments: Fragment[];
+    pendingCanvas: HTMLCanvasElement | null;
+  } = { active: false, startedAt: 0, fragments: [], pendingCanvas: null };
+
+  const drag: {
+    activeHand: string | null;
+    piece: Piece | null;
+    offsetX: number;
+    offsetY: number;
+  } = { activeHand: null, piece: null, offsetX: 0, offsetY: 0 };
+
+  const freezeGate = { holding: false, since: 0 };
+  const lastSeenFrame: { box: Box | null; at: number } = { box: null, at: 0 };
+  const countdownState = { active: false, startedAt: 0 };
+  const galleryEntries: HTMLCanvasElement[] = [];
+
+  // ---------- geometry / gesture helpers ----------
+  function dist2D(a: NormalizedLandmark, b: NormalizedLandmark) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+  function isPinching(hand: Hand) {
+    return dist2D(hand[LM.THUMB_TIP], hand[LM.INDEX_TIP]) < PINCH_THRESHOLD;
+  }
+  function isFist(hand: Hand) {
+    const wrist = hand[LM.WRIST];
+    const pairs: [number, number][] = [
+      [LM.INDEX_TIP, LM.INDEX_MCP],
+      [LM.MIDDLE_TIP, LM.MIDDLE_MCP],
+      [LM.RING_TIP, LM.RING_MCP],
+      [LM.PINKY_TIP, LM.PINKY_MCP],
+    ];
+    let curled = 0;
+    for (const [tipIdx, mcpIdx] of pairs) {
+      if (dist2D(hand[tipIdx], wrist) < dist2D(hand[mcpIdx], wrist)) curled++;
+    }
+    return curled >= 4;
+  }
+  function toPixel(lmNorm: { x: number; y: number }) {
+    return { x: lmNorm.x * canvas.width, y: lmNorm.y * canvas.height };
+  }
+  function mirrorX(lm: { x: number; y: number }) {
+    return { x: 1 - lm.x, y: lm.y };
+  }
+
+  function computeHandFrame(
+    indexTipA: { x: number; y: number },
+    indexTipB: { x: number; y: number },
+  ): Box {
+    const a = toPixel(indexTipA);
+    const b = toPixel(indexTipB);
+    const minX = Math.min(a.x, b.x) - FRAME_PADDING;
+    const maxX = Math.max(a.x, b.x) + FRAME_PADDING;
+    const minY = Math.min(a.y, b.y) - FRAME_PADDING;
+    const maxY = Math.max(a.y, b.y) + FRAME_PADDING;
+    const x = Math.max(0, minX);
+    const y = Math.max(0, minY);
+    const width = Math.min(canvas.width, maxX) - x;
+    const height = Math.min(canvas.height, maxY) - y;
+    return { x, y, width, height };
+  }
+
+  // ---------- rendering helpers ----------
+  function drawVideoFrame() {
+    ctx.save();
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+
+  function gaussianNoise(std: number) {
+    const u1 = Math.random() || 1e-6;
+    const u2 = Math.random();
+    const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return z0 * std;
+  }
+
+  function applyPhotoboothEffect(imageData: ImageData) {
+    const d = imageData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      let v = gray * PHOTOBOOTH_CONTRAST_ALPHA + PHOTOBOOTH_BRIGHTNESS_BETA;
+      v += gaussianNoise(PHOTOBOOTH_NOISE_STD);
+      v = Math.max(0, Math.min(255, v));
+      d[i] = d[i + 1] = d[i + 2] = v;
+    }
+    return imageData;
+  }
+
+  function applyBWInsideBox(box: Box) {
+    const x = Math.max(0, Math.round(box.x));
+    const y = Math.max(0, Math.round(box.y));
+    const w = Math.min(canvas.width - x, Math.round(box.width));
+    const h = Math.min(canvas.height - y, Math.round(box.height));
+    if (w <= 0 || h <= 0) return;
+    const region = ctx.getImageData(x, y, w, h);
+    applyPhotoboothEffect(region);
+    ctx.putImageData(region, x, y);
+  }
+
+  function drawLiveFrameOverlay(box: Box) {
+    ctx.save();
+    ctx.strokeStyle = "#f5c518";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    const cornerLen = 18;
+    ctx.lineWidth = 4;
+    const corners: [number, number, number, number][] = [
+      [box.x, box.y, 1, 1],
+      [box.x + box.width, box.y, -1, 1],
+      [box.x, box.y + box.height, 1, -1],
+      [box.x + box.width, box.y + box.height, -1, -1],
+    ];
+    for (const [cx, cy, dx, dy] of corners) {
+      ctx.beginPath();
+      ctx.moveTo(cx, cy + cornerLen * dy);
+      ctx.lineTo(cx, cy);
+      ctx.lineTo(cx + cornerLen * dx, cy);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function shuffle<T>(arr: T[]): T[] {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // ---------- puzzle lifecycle ----------
+  function startCountdown(frameBox: Box) {
+    puzzle.boardBox = { ...frameBox };
+    appState = "countdown";
+    countdownState.active = true;
+    countdownState.startedAt = performance.now();
+  }
+
+  function drawCountdownOverlay(box: Box) {
+    const elapsed = (performance.now() - countdownState.startedAt) / 1000;
+    const remaining = COUNTDOWN_SECONDS - elapsed;
+    if (remaining <= 0) {
+      finishCountdownAndCapture(box);
+      return;
+    }
+    applyBWInsideBox(box);
+    ctx.save();
+    ctx.strokeStyle = "#f5c518";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    const n = Math.ceil(remaining);
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    ctx.fillStyle = "rgba(10,10,8,0.45)";
+    ctx.fillRect(box.x, box.y, box.width, box.height);
+    ctx.font = `${Math.max(48, Math.min(box.width, box.height) * 0.4)}px 'IBM Plex Mono', monospace`;
+    ctx.fillStyle = "#f5c518";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(n), cx, cy);
+    ctx.restore();
+    cb.onStatus(`capturing in ${n}…`);
+  }
+
+  function isNearOwnCell(piece: Piece, box: Box, tileW: number, tileH: number) {
+    const correctX = box.x + piece.col * tileW;
+    const correctY = box.y + piece.row * tileH;
+    const dx = piece.x - correctX;
+    const dy = piece.y - correctY;
+    const tolerance = Math.min(tileW, tileH) * SNAP_DISTANCE_RATIO;
+    return Math.hypot(dx, dy) < tolerance;
+  }
+
+  function reconcilePlacedState(box: Box | null, tileW: number, tileH: number) {
+    if (!box || !puzzle.pieces.length) return false;
+    for (const piece of puzzle.pieces) {
+      if (piece.displacing || piece.dragging) continue;
+      piece.placed = isNearOwnCell(piece, box, tileW, tileH);
+    }
+    return puzzle.pieces.every((p) => p.placed);
+  }
+
+  function clampPieceToBoard(piece: Piece) {
+    const box = puzzle.boardBox!;
+    piece.x = Math.min(Math.max(piece.x, box.x), box.x + box.width - piece.w);
+    piece.y = Math.min(Math.max(piece.y, box.y), box.y + box.height - piece.h);
+  }
+
+  function snapPieceToCell(
+    piece: Piece,
+    box: Box,
+    tileW: number,
+    tileH: number,
+  ) {
+    displaceCellOccupant(piece, piece.row, piece.col, box, tileW, tileH);
+    const targetX = box.x + piece.col * tileW;
+    const targetY = box.y + piece.row * tileH;
+    piece.placed = true;
+    animateDisplacement(piece, targetX, targetY); // was: piece.x = targetX; piece.y = targetY;
+  }
+
+  function displaceCellOccupant(
+    piece: Piece,
+    targetRow: number,
+    targetCol: number,
+    box: Box,
+    tileW: number,
+    tileH: number,
+  ) {
+    const cellX = box.x + targetCol * tileW;
+    const cellY = box.y + targetRow * tileH;
+    const occupant = puzzle.pieces.find((p) => {
+      if (p === piece || p.displacing) return false;
+      const cx = p.x + p.w / 2;
+      const cy = p.y + p.h / 2;
+      return (
+        cx >= cellX && cx < cellX + tileW && cy >= cellY && cy < cellY + tileH
+      );
+    });
+    if (!occupant) return;
+    if (
+      occupant.row === targetRow &&
+      occupant.col === targetCol &&
+      occupant.placed
+    )
+      return;
+
+    occupant.placed = false;
+    const freeCells: { row: number; col: number }[] = [];
+    for (let row = 0; row < GRID; row++) {
+      for (let col = 0; col < GRID; col++) {
+        if (row === targetRow && col === targetCol) continue;
+        const cx0 = box.x + col * tileW;
+        const cy0 = box.y + row * tileH;
+        const taken = puzzle.pieces.some((p) => {
+          if (p === occupant || p === piece || p.displacing) return false;
+          const cx = p.x + p.w / 2;
+          const cy = p.y + p.h / 2;
+          return cx >= cx0 && cx < cx0 + tileW && cy >= cy0 && cy < cy0 + tileH;
+        });
+        if (!taken) freeCells.push({ row, col });
+      }
+    }
+    let targetSlot: { row: number; col: number };
+    if (freeCells.length > 0) {
+      targetSlot = freeCells[Math.floor(Math.random() * freeCells.length)];
+    } else {
+      targetSlot = { row: occupant.row, col: occupant.col };
+    }
+    const jitterX = (Math.random() - 0.5) * tileW * 0.5;
+    const jitterY = (Math.random() - 0.5) * tileH * 0.5;
+    const targetX = box.x + targetSlot.col * tileW + jitterX;
+    const targetY = box.y + targetSlot.row * tileH + jitterY;
+    animateDisplacement(occupant, targetX, targetY);
+  }
+
+  function animateDisplacement(piece: Piece, targetX: number, targetY: number) {
+    const startX = piece.x;
+    const startY = piece.y;
+    const startedAt = performance.now();
+    piece.displacing = true;
+    function step() {
+      if (destroyed) return;
+      const t = Math.min(1, (performance.now() - startedAt) / DISPLACE_ANIM_MS);
+      const eased = 1 - Math.pow(1 - t, 3);
+      piece.x = startX + (targetX - startX) * eased;
+      piece.y = startY + (targetY - startY) * eased;
+      if (t < 1) {
+        requestAnimationFrame(step);
+      } else {
+        piece.x = targetX;
+        piece.y = targetY;
+        piece.displacing = false;
+        clampPieceToBoard(piece);
+      }
+    }
+    requestAnimationFrame(step);
+  }
+
+  function finishCountdownAndCapture(box: Box) {
+    countdownState.active = false;
+
+    const mirroredFrame = document.createElement("canvas");
+    mirroredFrame.width = canvas.width;
+    mirroredFrame.height = canvas.height;
+    const mCtx = mirroredFrame.getContext("2d")!;
+    mCtx.save();
+    mCtx.translate(mirroredFrame.width, 0);
+    mCtx.scale(-1, 1);
+    mCtx.drawImage(videoEl, 0, 0, mirroredFrame.width, mirroredFrame.height);
+    mCtx.restore();
+
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = Math.max(1, Math.round(box.width));
+    cropCanvas.height = Math.max(1, Math.round(box.height));
+    const cropCtx = cropCanvas.getContext("2d")!;
+    cropCtx.drawImage(
+      mirroredFrame,
+      box.x,
+      box.y,
+      box.width,
+      box.height,
+      0,
+      0,
+      cropCanvas.width,
+      cropCanvas.height,
+    );
+
+    const fullImageData = cropCtx.getImageData(
+      0,
+      0,
+      cropCanvas.width,
+      cropCanvas.height,
+    );
+    applyPhotoboothEffect(fullImageData);
+    cropCtx.putImageData(fullImageData, 0, 0);
+
+    puzzle.fullPhotoboothCanvas = cropCanvas;
+
+    const tileW = Math.floor(cropCanvas.width / GRID);
+    const tileH = Math.floor(cropCanvas.height / GRID);
+    const pieces: Piece[] = [];
+    for (let row = 0; row < GRID; row++) {
+      for (let col = 0; col < GRID; col++) {
+        const sx = col * tileW;
+        const sy = row * tileH;
+        const w = col === GRID - 1 ? cropCanvas.width - sx : tileW;
+        const h = row === GRID - 1 ? cropCanvas.height - sy : tileH;
+        const pieceCanvas = document.createElement("canvas");
+        pieceCanvas.width = w;
+        pieceCanvas.height = h;
+        pieceCanvas
+          .getContext("2d")!
+          .drawImage(cropCanvas, sx, sy, w, h, 0, 0, w, h);
+        pieces.push({
+          row,
+          col,
+          canvas: pieceCanvas,
+          w,
+          h,
+          x: 0,
+          y: 0,
+          placed: false,
+          dragging: false,
+        });
+      }
+    }
+
+    const slots: { x: number; y: number }[] = [];
+    for (let row = 0; row < GRID; row++) {
+      for (let col = 0; col < GRID; col++) {
+        slots.push({ x: box.x + col * tileW, y: box.y + row * tileH });
+      }
+    }
+    shuffle(slots);
+    pieces.forEach((piece, i) => {
+      piece.x = slots[i].x;
+      piece.y = slots[i].y;
+      if (isNearOwnCell(piece, box, tileW, tileH)) {
+        snapPieceToCell(piece, box, tileW, tileH);
+      }
+    });
+
+    puzzle.boardBox = box;
+    puzzle.pieces = pieces;
+    puzzle.tileW = tileW;
+    puzzle.tileH = tileH;
+    puzzle.solved = pieces.every((p) => p.placed);
+    appState = "puzzle";
+    fistHoldCounter = 0;
+    updateProgressBadge();
+  }
+
+  function findNearestPiece(px: number, py: number): Piece | null {
+    let best: Piece | null = null;
+    let bestDist = Infinity;
+    for (const piece of puzzle.pieces) {
+      if (piece.displacing) continue;
+      const cx = piece.x + piece.w / 2;
+      const cy = piece.y + piece.h / 2;
+      const d = Math.hypot(px - cx, py - cy);
+      if (d < Math.max(piece.w, piece.h) * 0.75 && d < bestDist) {
+        best = piece;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  function handleDragForHand(
+    handLabel: string,
+    pinching: boolean,
+    indexPx: { x: number; y: number },
+  ) {
+    if (pinching) {
+      if (drag.activeHand === null) {
+        const candidate = findNearestPiece(indexPx.x, indexPx.y);
+        if (candidate) {
+          drag.activeHand = handLabel;
+          drag.piece = candidate;
+          drag.offsetX = indexPx.x - candidate.x;
+          drag.offsetY = indexPx.y - candidate.y;
+          candidate.dragging = true;
+          candidate.placed = false;
+        }
+      } else if (drag.activeHand === handLabel && drag.piece) {
+        drag.piece.x = indexPx.x - drag.offsetX;
+        drag.piece.y = indexPx.y - drag.offsetY;
+      }
+    } else if (drag.activeHand === handLabel && drag.piece) {
+      const piece = drag.piece;
+      piece.dragging = false;
+      if (isNearOwnCell(piece, puzzle.boardBox!, puzzle.tileW, puzzle.tileH)) {
+        snapPieceToCell(piece, puzzle.boardBox!, puzzle.tileW, puzzle.tileH);
+      } else {
+        clampPieceToBoard(piece);
+        const box = puzzle.boardBox!;
+        const cx = piece.x + piece.w / 2;
+        const cy = piece.y + piece.h / 2;
+        const dropCol = Math.min(
+          GRID - 1,
+          Math.max(0, Math.floor((cx - box.x) / puzzle.tileW)),
+        );
+        const dropRow = Math.min(
+          GRID - 1,
+          Math.max(0, Math.floor((cy - box.y) / puzzle.tileH)),
+        );
+        displaceCellOccupant(
+          piece,
+          dropRow,
+          dropCol,
+          box,
+          puzzle.tileW,
+          puzzle.tileH,
+        );
+      }
+      drag.activeHand = null;
+      drag.piece = null;
+      puzzle.solved = reconcilePlacedState(
+        puzzle.boardBox,
+        puzzle.tileW,
+        puzzle.tileH,
+      );
+      updateProgressBadge();
+    }
+  }
+
+  function drawBoardAndPieces() {
+    const box = puzzle.boardBox!;
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(box.x, box.y, box.width, box.height);
+    ctx.restore();
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(245,197,24,0.18)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < GRID; i++) {
+      ctx.beginPath();
+      ctx.moveTo(box.x + i * puzzle.tileW, box.y);
+      ctx.lineTo(box.x + i * puzzle.tileW, box.y + box.height);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(box.x, box.y + i * puzzle.tileH);
+      ctx.lineTo(box.x + box.width, box.y + i * puzzle.tileH);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const sorted = [...puzzle.pieces].sort(
+      (a, b) => (a.dragging ? 1 : 0) - (b.dragging ? 1 : 0),
+    );
+    for (const piece of sorted) {
+      ctx.save();
+      if (piece.dragging) {
+        ctx.shadowColor = "rgba(245,197,24,0.9)";
+        ctx.shadowBlur = 14;
+      }
+      ctx.drawImage(piece.canvas, piece.x, piece.y, piece.w, piece.h);
+      ctx.strokeStyle = piece.placed ? "#5fae6e" : "rgba(234,229,214,0.5)";
+      ctx.lineWidth = piece.dragging ? 3 : 1.5;
+      ctx.strokeRect(piece.x, piece.y, piece.w, piece.h);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.strokeStyle = puzzle.solved ? "#5fae6e" : "#f5c518";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    ctx.restore();
+
+    if (puzzle.solved) {
+      ctx.save();
+      ctx.fillStyle = "rgba(95,174,110,0.15)";
+      ctx.fillRect(box.x, box.y, box.width, box.height);
+      ctx.font = `${Math.max(20, box.width * 0.07)}px 'IBM Plex Mono', monospace`;
+      ctx.fillStyle = "#5fae6e";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(
+        "SOLVED — make a fist to save",
+        box.x + box.width / 2,
+        box.y + box.height / 2,
+      );
+      ctx.restore();
+    }
+  }
+
+  function updateProgressBadge() {
+    if (appState !== "puzzle") {
+      cb.onProgress(false, "", false);
+      return;
+    }
+    const placedCount = puzzle.pieces.filter((p) => p.placed).length;
+    cb.onProgress(
+      true,
+      `${placedCount} / ${puzzle.pieces.length} pieces placed`,
+      puzzle.solved,
+    );
+  }
+
+  function isPointInBoard(px: number, py: number, box: Box | null) {
+    if (!box) return false;
+    return (
+      px >= box.x &&
+      px <= box.x + box.width &&
+      py >= box.y &&
+      py <= box.y + box.height
+    );
+  }
+
+  function drawHandSkeleton(landmarksPx: { x: number; y: number }[]) {
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.shadowColor = "rgba(255,255,255,0.85)";
+    ctx.shadowBlur = 10;
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 3;
+    for (const [iA, iB] of HAND_CONNECTIONS) {
+      const a = landmarksPx[iA];
+      const b = landmarksPx[iB];
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = "white";
+    for (const p of landmarksPx) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawHandSkeletonsOverBoard(handsLandmarks: Hand[], box: Box | null) {
+    if (!box || handsLandmarks.length === 0) return;
+    for (const lm of handsLandmarks) {
+      const landmarksPx = lm.map((pt) => toPixel(mirrorX(pt)));
+      const overBoard = landmarksPx.some((p) => isPointInBoard(p.x, p.y, box));
+      if (overBoard) drawHandSkeleton(landmarksPx);
+    }
+  }
+
+  // ---------- shatter (save) animation ----------
+  function startShatter(sourceCanvas: HTMLCanvasElement, box: Box) {
+    const cols = SHATTER_COLS;
+    const rows = SHATTER_ROWS;
+    const fragW = sourceCanvas.width / cols;
+    const fragH = sourceCanvas.height / rows;
+    const fragments: Fragment[] = [];
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const sx = col * fragW;
+        const sy = row * fragH;
+        const fragCanvas = document.createElement("canvas");
+        fragCanvas.width = Math.ceil(fragW);
+        fragCanvas.height = Math.ceil(fragH);
+        fragCanvas
+          .getContext("2d")!
+          .drawImage(
+            sourceCanvas,
+            sx,
+            sy,
+            fragW,
+            fragH,
+            0,
+            0,
+            fragCanvas.width,
+            fragCanvas.height,
+          );
+        const cx = box.x + sx + fragW / 2;
+        const cy = box.y + sy + fragH / 2;
+        const boardCx = box.x + box.width / 2;
+        const boardCy = box.y + box.height / 2;
+        const dirX = cx - boardCx;
+        const dirY = cy - boardCy;
+        const dirLen = Math.max(1, Math.hypot(dirX, dirY));
+        const speed = 90 + Math.random() * 160;
+        fragments.push({
+          canvas: fragCanvas,
+          x: cx,
+          y: cy,
+          w: fragW,
+          h: fragH,
+          vx: (dirX / dirLen) * speed + (Math.random() - 0.5) * 40,
+          vy: (dirY / dirLen) * speed + (Math.random() - 0.5) * 40 - 60,
+          rotation: 0,
+          rotationSpeed: (Math.random() - 0.5) * 6,
+          gravity: 220 + Math.random() * 80,
+        });
+      }
+    }
+    shatter.fragments = fragments;
+    shatter.active = true;
+    shatter.startedAt = performance.now();
+    appState = "shattering";
+  }
+
+  function updateAndDrawShatter() {
+    const elapsedMs = performance.now() - shatter.startedAt;
+    const t = Math.min(1, elapsedMs / SHATTER_DURATION_MS);
+    if (t >= 1) {
+      finishShatter();
+      return;
+    }
+    const dt = 1 / 60;
+    const fadeStart = 0.45;
+    ctx.save();
+    for (const frag of shatter.fragments) {
+      frag.x += frag.vx * dt;
+      frag.y += frag.vy * dt;
+      frag.vy += frag.gravity * dt;
+      frag.rotation += frag.rotationSpeed * dt;
+      const alpha =
+        t < fadeStart ? 1 : Math.max(0, 1 - (t - fadeStart) / (1 - fadeStart));
+      const scale = 1 - t * 0.25;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(frag.x, frag.y);
+      ctx.rotate(frag.rotation);
+      ctx.scale(scale, scale);
+      ctx.drawImage(frag.canvas, -frag.w / 2, -frag.h / 2, frag.w, frag.h);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function finishShatter() {
+    shatter.active = false;
+    shatter.fragments = [];
+    if (shatter.pendingCanvas) {
+      addToGallery(shatter.pendingCanvas);
+      cb.onStatus("saved to the strip!");
+      shatter.pendingCanvas = null;
+    }
+    resetPuzzleOnly();
+  }
+
+  function addToGallery(snapshotCanvas: HTMLCanvasElement) {
+    if (galleryEntries.length >= STRIP_MAX_PHOTOS) return;
+    galleryEntries.push(snapshotCanvas);
+    cb.onGalleryAdd(snapshotCanvas, galleryEntries.length);
+    if (galleryEntries.length >= STRIP_MAX_PHOTOS) {
+      cb.onGalleryFull();
+      downloadStrip();
+    }
+  }
+
+  function handleFistReset() {
+    if (appState !== "puzzle") {
+      cb.onStatus("reset (fist)");
+      resetPuzzleOnly();
+      return;
+    }
+    const reallySolved = reconcilePlacedState(
+      puzzle.boardBox,
+      puzzle.tileW,
+      puzzle.tileH,
+    );
+    puzzle.solved = reallySolved;
+    if (reallySolved && puzzle.fullPhotoboothCanvas) {
+      shatter.pendingCanvas = puzzle.fullPhotoboothCanvas;
+      startShatter(puzzle.fullPhotoboothCanvas, puzzle.boardBox!);
+    } else {
+      cb.onStatus("reset (fist)");
+      resetPuzzleOnly();
+    }
+  }
+
+  function resetPuzzleOnly() {
+    puzzle.boardBox = null;
+    puzzle.pieces = [];
+    puzzle.solved = false;
+    puzzle.fullPhotoboothCanvas = null;
+    appState = "tracking";
+    countdownState.active = false;
+    drag.activeHand = null;
+    drag.piece = null;
+    shatter.active = false;
+    shatter.fragments = [];
+    shatter.pendingCanvas = null;
+    fistHoldCounter = 0;
+    lastSeenFrame.box = null;
+    lastSeenFrame.at = 0;
+    updateProgressBadge();
+  }
+
+  function downloadStrip() {
+    if (galleryEntries.length === 0) return;
+    const entries = galleryEntries;
+    const border = 24;
+    const gap = 16;
+    const targetW = entries[0].width;
+    const scaledHeights = entries.map((c) =>
+      Math.round(c.height * (targetW / c.width)),
+    );
+    const totalH =
+      border * 2 +
+      scaledHeights.reduce((s, h) => s + h, 0) +
+      gap * (entries.length - 1);
+    const totalW = targetW + border * 2;
+    const stripCanvas = document.createElement("canvas");
+    stripCanvas.width = totalW;
+    stripCanvas.height = totalH;
+    const sctx = stripCanvas.getContext("2d")!;
+    sctx.fillStyle = "#ffffff";
+    sctx.fillRect(0, 0, totalW, totalH);
+    let cursorY = border;
+    entries.forEach((entryCanvas, i) => {
+      const h = scaledHeights[i];
+      sctx.drawImage(entryCanvas, border, cursorY, targetW, h);
+      cursorY += h + gap;
+    });
+    stripCanvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `puzzlecam_strip_${Date.now()}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }, "image/png");
+  }
+
+  function resetEverything() {
+    galleryEntries.length = 0;
+    cb.onReset();
+    resetPuzzleOnly();
+    cb.onStatus("reset");
+  }
+
+  // ---------- main per-frame processing ----------
+  function processResults(handsLandmarks: Hand[]) {
+    if (appState === "shattering") {
+      updateAndDrawShatter();
+      cb.onStatus("saving…");
+      return;
+    }
+
+    const noHands = handsLandmarks.length === 0;
+
+    if (noHands) {
+      cb.onDotState(puzzle.solved ? "solved" : "idle");
+      fistHoldCounter = 0;
+      freezeGate.holding = false;
+      if (drag.activeHand && drag.piece) {
+        handleDragForHand(drag.activeHand, false, {
+          x: drag.piece.x,
+          y: drag.piece.y,
+        });
+      }
+      if (appState === "tracking") {
+        const sinceLastSeen = performance.now() - lastSeenFrame.at;
+        if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
+          applyBWInsideBox(lastSeenFrame.box);
+          drawLiveFrameOverlay(lastSeenFrame.box);
+        }
+        cb.onStatus(
+          galleryEntries.length >= STRIP_MAX_PHOTOS
+            ? "strip complete"
+            : "looking for hands…",
+        );
+        return;
+      }
+      if (appState === "countdown") {
+        drawCountdownOverlay(puzzle.boardBox!);
+        return;
+      }
+      if (appState === "puzzle") {
+        puzzle.solved = reconcilePlacedState(
+          puzzle.boardBox,
+          puzzle.tileW,
+          puzzle.tileH,
+        );
+        updateProgressBadge();
+        drawBoardAndPieces();
+        cb.onStatus(
+          puzzle.solved
+            ? "puzzle complete! make a fist to save"
+            : "solve with a pinch",
+        );
+      }
+      return;
+    }
+
+    cb.onDotState(puzzle.solved ? "solved" : "live");
+
+    const anyFist = handsLandmarks.some((lm) => isFist(lm));
+    const draggingNow = drag.activeHand !== null && drag.piece !== null;
+    if (anyFist && !draggingNow && appState !== "tracking") {
+      fistHoldCounter++;
+      if (fistHoldCounter >= FIST_HOLD_FRAMES) {
+        fistHoldCounter = 0;
+        handleFistReset();
+        return;
+      }
+    } else {
+      fistHoldCounter = 0;
+    }
+
+    if (appState === "tracking") {
+      if (galleryEntries.length >= STRIP_MAX_PHOTOS) {
+        cb.onStatus("strip complete — download or reset");
+        return;
+      }
+      if (handsLandmarks.length === 2) {
+        const [handA, handB] = handsLandmarks;
+        const indexA = mirrorX(handA[LM.INDEX_TIP]);
+        const indexB = mirrorX(handB[LM.INDEX_TIP]);
+        const frameBox = computeHandFrame(indexA, indexB);
+        if (frameBox.width > 4 && frameBox.height > 4) {
+          applyBWInsideBox(frameBox);
+          drawLiveFrameOverlay(frameBox);
+          lastSeenFrame.box = frameBox;
+          lastSeenFrame.at = performance.now();
+        }
+        const bothPinching = isPinching(handA) && isPinching(handB);
+        if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
+          if (!freezeGate.holding) {
+            freezeGate.holding = true;
+            freezeGate.since = performance.now();
+          }
+          cb.onDotState("armed");
+          cb.onStatus("hold the pinch…");
+          if (performance.now() - freezeGate.since > FREEZE_HOLD_MS) {
+            freezeGate.holding = false;
+            startCountdown(frameBox);
+          }
+        } else {
+          freezeGate.holding = false;
+          cb.onStatus("tracking hands");
+        }
+      } else {
+        freezeGate.holding = false;
+        const sinceLastSeen = performance.now() - lastSeenFrame.at;
+        if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
+          applyBWInsideBox(lastSeenFrame.box);
+          drawLiveFrameOverlay(lastSeenFrame.box);
+        }
+        cb.onStatus("tracking hands — show both index fingers");
+      }
+      return;
+    }
+
+    if (appState === "countdown") {
+      drawCountdownOverlay(puzzle.boardBox!);
+      return;
+    }
+
+    if (appState === "puzzle") {
+      const labelsPresent = new Set<string>();
+      handsLandmarks.forEach((lm, i) => {
+        const label = i === 0 ? "A" : "B";
+        labelsPresent.add(label);
+        const pinching = isPinching(lm);
+        const indexPx = toPixel(mirrorX(lm[LM.INDEX_TIP]));
+        handleDragForHand(label, pinching, indexPx);
+      });
+      if (
+        drag.activeHand &&
+        !labelsPresent.has(drag.activeHand) &&
+        drag.piece
+      ) {
+        handleDragForHand(drag.activeHand, false, {
+          x: drag.piece.x,
+          y: drag.piece.y,
+        });
+      }
+      if (!drag.piece) {
+        puzzle.solved = reconcilePlacedState(
+          puzzle.boardBox,
+          puzzle.tileW,
+          puzzle.tileH,
+        );
+        updateProgressBadge();
+      }
+      drawBoardAndPieces();
+      drawHandSkeletonsOverBoard(handsLandmarks, puzzle.boardBox);
+      cb.onStatus(
+        puzzle.solved
+          ? fistHoldCounter > 0
+            ? `saving… hold fist (${fistHoldCounter}/${FIST_HOLD_FRAMES})`
+            : "puzzle complete! make a fist to save"
+          : "solve with a pinch",
+      );
+    }
+  }
+
+  function renderLoop() {
+    if (destroyed) return;
+    if (videoEl.readyState >= 2 && handLandmarker) {
+      drawVideoFrame();
+      const result = handLandmarker.detectForVideo(videoEl, performance.now());
+      processResults((result.landmarks as Hand[]) ?? []);
+    }
+    rafId = requestAnimationFrame(renderLoop);
+  }
+
+  // ---------- boot ----------
+  function withTimeout<T>(
+    promise: Promise<T>,
+    ms: number,
+    message: string,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  async function initHandLandmarker(): Promise<HandLandmarker> {
+    const vision = await withTimeout(
+      FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.17/wasm",
+      ),
+      LOAD_TIMEOUT_MS,
+      "Timed out loading the MediaPipe WASM runtime. Check your connection.",
+    );
+    try {
+      return await withTimeout(
+        HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        }),
+        LOAD_TIMEOUT_MS,
+        "Timed out loading the hand model with GPU.",
+      );
+    } catch (gpuErr) {
+      console.warn(
+        "[PuzzleCam] GPU delegate failed, retrying with CPU…",
+        gpuErr,
+      );
+    }
+    return withTimeout(
+      HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "CPU",
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.6,
+        minHandPresenceConfidence: 0.6,
+        minTrackingConfidence: 0.6,
+      }),
+      LOAD_TIMEOUT_MS,
+      "Timed out loading the hand model even with CPU.",
+    );
+  }
+
+  async function initWebcam() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: "user",
+      },
+      audio: false,
+    });
+    videoEl.srcObject = stream;
+    await new Promise<void>((resolve) => {
+      videoEl.onloadedmetadata = () => {
+        videoEl.play();
+        resolve();
+      };
+    });
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+  }
+
+  if (!videoEl.srcObject) {
+    await initWebcam();
+  }
+  handLandmarker = await initHandLandmarker();
+  cb.onStatus("ready");
+  rafId = requestAnimationFrame(renderLoop);
+
+  return {
+    destroy: () => {
+      destroyed = true;
+      cancelAnimationFrame(rafId);
+      handLandmarker?.close();
+      const stream = videoEl.srcObject as MediaStream | null;
+      stream?.getTracks().forEach((t) => t.stop());
+    },
+    downloadStrip,
+    resetEverything,
+  };
+}
